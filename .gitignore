@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+data/
+db/
+# results: keep small summaries (markdown, csv) in per-dataset folders, nothing else
+results/**
+!results/**/
+!results/**/*.md
+!results/**/*.csv
+.DS_Store
+.idea
+.claude/

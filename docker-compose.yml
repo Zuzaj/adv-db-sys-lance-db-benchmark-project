@@ -1,0 +1,50 @@
+name: lancedb-bench
+
+# Two containers, as agreed in class (also for embedded databases):
+#   db      LanceDB (embedded) behind the FastAPI wrapper. Holds train.csv and the LanceDB directory.
+#   client  Benchmark client. Holds test.csv, ground_truth.csv and manifest.json only, talks to db over HTTP.
+#
+#   docker compose up -d --build db
+#   docker compose exec db python scripts/ingest.py --dataset cohere-small-100k
+#   docker compose run --rm client python scripts/check_setup.py
+x-limits: &limits
+  cpuset: "0-3"      # 4 pinned cores
+  mem_limit: 8g
+  memswap_limit: 8g  # swap off
+
+services:
+  db:
+    build:
+      context: .
+      args:
+        ROLE: db
+    container_name: lancedb_server
+    <<: *limits
+    command: uvicorn lancedb_bench.server:app --host 0.0.0.0 --port 8000 --workers 1
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data/db:/data:ro   # <dataset>/train.csv (read-only: the data may be hard-linked from another project)
+      - ./db:/db          # LanceDB directory
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:8000/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+
+  client:
+    build:
+      context: .
+      args:
+        ROLE: client
+    container_name: lancedb_client
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      - SERVER_URL=http://db:8000
+      - DATASET  # passed through from the host if set, default cohere-small-100k
+    volumes:
+      - ./data/client:/data:ro   # <dataset>/test.csv, ground_truth.csv, manifest.json
+      - ./results:/results
