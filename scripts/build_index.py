@@ -1,4 +1,4 @@
-"""DB side: build the IVF_PQ vector index (metric from config.DATASETS) and a BTree on id, then optimize and report sizes."""
+"""DB side (run in the db image): build the IVF_PQ vector index (metric from config.DATASETS) and a BTree on id, then optimize and report sizes."""
 import argparse
 import time
 from datetime import timedelta
@@ -7,10 +7,11 @@ import lancedb
 from lancedb.index import BTree, IvfPq
 
 from lancedb_bench.config import DB_URI, add_dataset_arg, index_defaults, select_datasets
-from lancedb_bench.metrics import get_dir_size_mb, get_peak_rss_mb
+from lancedb_bench.metrics import dir_size_mb
 
 
-def build(db, ds, partitions: int | None, sub_vectors: int | None) -> None:
+def build(db, ds, partitions: int | None, sub_vectors: int | None) -> float:
+    """Build the vector index and the id index, then optimize. Returns the time in seconds."""
     table = db.open_table(ds.table)
     n, dim = table.count_rows(), table.schema.field("vector").type.list_size
     default_partitions, default_sub_vectors = index_defaults(n, dim)
@@ -18,7 +19,8 @@ def build(db, ds, partitions: int | None, sub_vectors: int | None) -> None:
     if dim % sub_vectors:
         raise SystemExit(f"num_sub_vectors={sub_vectors} must divide dim={dim}")
 
-    print(f"{ds.name}: {n} rows, dim {dim}, metric {ds.metric}; table size before index {get_dir_size_mb(ds.table_dir):.0f} MB")
+    start = time.perf_counter()
+    print(f"{ds.name}: {n} rows, dim {dim}, metric {ds.metric}; table size before index {dir_size_mb(ds.table_dir):.0f} MB")
     t0 = time.perf_counter()
     table.create_index(
         "vector",
@@ -31,10 +33,12 @@ def build(db, ds, partitions: int | None, sub_vectors: int | None) -> None:
     print(f"  BTree on id built in {time.perf_counter() - t0:.1f}s")
 
     table.optimize(cleanup_older_than=timedelta(0))  # also drops old versions, so the size below is the live size
-    print(f"  table size after optimize: {get_dir_size_mb(ds.table_dir):.0f} MB, peak RSS {get_peak_rss_mb():.0f} MB")
+    seconds = time.perf_counter() - start
+    print(f"  table size after optimize: {dir_size_mb(ds.table_dir):.0f} MB; index build, id index and optimize took {seconds:.1f}s")
     for i in table.list_indices():
         print(f"  index {i.name}: {i.index_type}, {i.size_bytes / 1048576:.1f} MB, indexed rows {i.num_indexed_rows}")
-    print("  the running server keeps old table handles until POST /reload (scripts/check_setup.py and bench.py call it)")
+    print("  the running server keeps old table handles until POST /reload (populate.py calls it)")
+    return seconds
 
 
 def main() -> None:

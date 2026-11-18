@@ -1,0 +1,2 @@
+group,system,version,dataset,ingest_s,db_mb,peak_mem_mb,cpu,cores,ram_gb,date,kmeans_s
+07-strycharz-jarlaczynska,lancedb,0.40.0,cohere-small-100k,118.19,314.6,1718,aarch64,4,8.3,2026-11-18,8.75

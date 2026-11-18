@@ -1,0 +1,9 @@
+group,system,version,dataset,k,setting_name,setting_value,recall,p50_ms,p95_ms,p99_ms
+07-strycharz-jarlaczynska,lancedb,0.40.0,cohere-small-100k,10,nprobes,5,0.9298,6.473,10.239,17.826
+07-strycharz-jarlaczynska,lancedb,0.40.0,cohere-small-100k,10,nprobes,10,0.9643,7.423,9.644,17.759
+07-strycharz-jarlaczynska,lancedb,0.40.0,cohere-small-100k,10,nprobes,20,0.9744,10.01,11.923,13.611
+07-strycharz-jarlaczynska,lancedb,0.40.0,cohere-small-100k,10,nprobes,50,0.975,10.942,12.368,12.938
+07-strycharz-jarlaczynska,lancedb,0.40.0,cohere-small-100k,100,nprobes,5,0.8975,16.048,18.838,21.994
+07-strycharz-jarlaczynska,lancedb,0.40.0,cohere-small-100k,100,nprobes,10,0.9588,16.805,19.313,24.468
+07-strycharz-jarlaczynska,lancedb,0.40.0,cohere-small-100k,100,nprobes,20,0.9793,18.667,20.403,22.331
+07-strycharz-jarlaczynska,lancedb,0.40.0,cohere-small-100k,100,nprobes,50,0.9802,19.789,21.454,23.175

@@ -1,51 +1,48 @@
 """HTTP wrapper around the embedded LanceDB database: the service of the db container.
 
-The database container holds train.csv and the LanceDB directory (DB_URI); clients only send queries.
-Ingest and index building are not endpoints: run scripts/ingest.py and scripts/build_index.py in this
-container, then call POST /reload (scripts/check_setup.py does) so cached table handles see the new data.
+The db container holds all dataset files (mounted read-only as /data), the LanceDB directory (DB_URI) and the results
+directory. The client container sends goals to POST /goal/{n} (`db <goal> <params...>`); the goals, including the
+timed benchmark (goal 8), run here next to the database, so the measured times do not include the client-server hop.
+Populating (scripts/populate.py) runs in the db image, not through HTTP; it calls POST /reload afterwards so cached
+table handles see the new data.
 """
 import os
 import platform
-import time
+from typing import Any
 
 import lancedb
-import numpy as np
 import psutil
 import pyarrow
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 from lancedb_bench.config import DATASETS, DB_URI, get_dataset
-from lancedb_bench.metrics import get_dir_size_mb, get_peak_rss_mb
+from lancedb_bench.goals import GOAL_FUNCTIONS, Context, InvalidParameters, NotReady
+from lancedb_bench.metrics import dir_size_mb
+from lancedb_bench.spec import parse_params
 
 app = FastAPI(title="LanceDB wrapper")
 db = lancedb.connect(DB_URI)
-_tables: dict = {}  # dataset name -> (table, dim)
+_contexts: dict[str, Context] = {}  # dataset name -> open table and its facts
 
 
 def table_exists(name: str) -> bool:
     return get_dataset(name).table in list(db.list_tables().tables)
 
 
-def get_table(name: str):
+def get_context(name: str) -> Context:
     if name not in DATASETS:
-        raise HTTPException(404, f"unknown dataset {name!r}; known: {', '.join(DATASETS)}")
-    if name not in _tables:
+        raise HTTPException(422, f"unknown dataset {name!r}; known: {', '.join(DATASETS)}")
+    if name not in _contexts:
         if not table_exists(name):
-            raise HTTPException(503, f"table for {name!r} not found: run scripts/ingest.py --dataset {name} in the db container")
-        table = db.open_table(get_dataset(name).table)
-        _tables[name] = (table, table.schema.field("vector").type.list_size)
-    return _tables[name]
+            raise HTTPException(503, f"table for {name!r} not found: run `docker compose run --rm populate` with DATASET={name}")
+        _contexts[name] = Context.open(db, get_dataset(name))
+    return _contexts[name]
 
 
-class SearchRequest(BaseModel):
+class GoalRequest(BaseModel):
     dataset: str
-    vector: list[float] | None = None
-    id: int | None = None  # alternative to `vector`: search around a stored vector, excluding itself
-    k: int = 10
-    nprobes: int = 20
-    refine_factor: int | None = None
-    bypass_index: bool = False  # exact (brute force) search
+    params: list[Any] = []
 
 
 @app.get("/health")
@@ -63,8 +60,6 @@ def info():
         "cores": psutil.cpu_count(logical=True),
         "cores_allowed": len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else None,
         "ram_gb": round(psutil.virtual_memory().total / 1e9, 1),
-        "rss_mb": round(psutil.Process().memory_info().rss / 1e6, 1),
-        "peak_rss_mb": get_peak_rss_mb(),
     }
 
 
@@ -79,17 +74,10 @@ def datasets():
             table = db.open_table(ds.table)
             entry["rows"] = table.count_rows()
             entry["dim"] = table.schema.field("vector").type.list_size
-            entry["size_mb"] = get_dir_size_mb(ds.table_dir)
+            entry["size_mb"] = dir_size_mb(ds.table_dir)
             entry["indexes"] = [
-                {
-                    "name": i.name,
-                    "type": i.index_type,
-                    "columns": list(i.columns),
-                    "num_indexed_rows": i.num_indexed_rows,
-                    "num_unindexed_rows": i.num_unindexed_rows,
-                    "size_mb": round(i.size_bytes / (1024 * 1024), 1),
-                    "metric": (i.index_details or {}).get("metric_type"),
-                }
+                {"name": i.name, "type": i.index_type, "columns": list(i.columns), "num_unindexed_rows": i.num_unindexed_rows,
+                 "size_mb": round(i.size_bytes / (1024 * 1024), 1), "metric": (i.index_details or {}).get("metric_type")}
                 for i in table.list_indices()
             ]
         out.append(entry)
@@ -98,53 +86,31 @@ def datasets():
 
 @app.post("/reload")
 def reload():
-    """Forget cached table handles; the next search reopens the latest version."""
-    _tables.clear()
+    """Forget cached table handles; the next goal reopens the latest version."""
+    _contexts.clear()
     return {"status": "reloaded"}
 
 
-@app.post("/search")
-def search(req: SearchRequest):
+@app.post("/goal/{goal}")
+def run_goal(goal: int, req: GoalRequest):
+    """Run one goal. 422: invalid parameters, 409: a precondition is missing (no clustering yet), 503: no table."""
+    try:
+        values = parse_params(goal, req.params)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))
     for attempt in (1, 2):
+        ctx = get_context(req.dataset)
         try:
-            return run_search(req)
-        except HTTPException:
-            raise
+            out = GOAL_FUNCTIONS[goal](ctx, *values)
+            break
+        except InvalidParameters as exc:
+            raise HTTPException(422, str(exc))
+        except NotReady as exc:
+            raise HTTPException(409, str(exc))
         except Exception:
             if attempt == 2:
                 raise
-            _tables.pop(req.dataset, None)  # stale handle (table rebuilt or old versions cleaned up since it was opened): reopen once
-
-
-def run_search(req: SearchRequest) -> dict:
-    table, dim = get_table(req.dataset)
-    metric = get_dataset(req.dataset).metric
-    k = req.k
-
-    if req.vector is not None:
-        vec = np.asarray(req.vector, dtype=np.float32)
-    elif req.id is not None:
-        rows = table.search().where(f"id = {req.id}").select(["vector"]).limit(1).to_arrow()
-        if rows.num_rows == 0:
-            raise HTTPException(404, f"id {req.id} not found in {req.dataset}")
-        vec = np.array(rows["vector"][0].as_py(), dtype=np.float32)
-        k += 1  # the stored vector finds itself at distance 0
-    else:
-        raise HTTPException(400, "provide `vector` or `id`")
-    if vec.shape != (dim,):
-        raise HTTPException(400, f"vector has {vec.size} values, {req.dataset} has dimension {dim}")
-
-    q = table.search(vec).distance_type(metric).limit(k).select(["id", "_distance"])
-    q = q.bypass_vector_index() if req.bypass_index else q.nprobes(req.nprobes)
-    if req.refine_factor is not None and not req.bypass_index:
-        q = q.refine_factor(req.refine_factor)
-
-    t0 = time.perf_counter_ns()
-    res = q.to_arrow()
-    engine_ms = (time.perf_counter_ns() - t0) / 1e6
-
-    ids, dists = res["id"].to_pylist(), res["_distance"].to_pylist()
-    if req.id is not None:
-        pairs = [(i, d) for i, d in zip(ids, dists) if i != req.id][:req.k]
-        ids, dists = [p[0] for p in pairs], [p[1] for p in pairs]
-    return {"engine_latency_ms": engine_ms, "ids": ids, "distances": dists}
+            _contexts.pop(req.dataset, None)  # stale handle (table rebuilt or old versions cleaned up since it was opened): reopen once
+    if goal == 4:
+        _contexts.pop(req.dataset, None)  # the clustering added a column and a table version
+    return out

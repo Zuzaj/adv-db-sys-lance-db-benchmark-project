@@ -1,4 +1,4 @@
-"""DB side: stream DATA_DIR/<dataset>/train.csv into its LanceDB table, then check row count and stored vectors."""
+"""DB side (run in the db image): stream DATA_DIR/<dataset>/train.csv into its LanceDB table, then check row count and stored vectors."""
 import argparse
 import itertools
 import time
@@ -9,12 +9,13 @@ import pyarrow as pa
 
 from lancedb_bench.config import DB_URI, add_dataset_arg, select_datasets
 from lancedb_bench.data import stream_vectors
-from lancedb_bench.metrics import get_dir_size_mb, get_peak_rss_mb
+from lancedb_bench.metrics import dir_size_mb
 
 
-def ingest(db, ds) -> None:
+def ingest(db, ds) -> float:
+    """Load train.csv into the table. Returns the loading time in seconds."""
     if not ds.train_path.exists():
-        raise SystemExit(f"{ds.train_path} not found: run scripts/download.py --dataset {ds.name} (or put train.csv there)")
+        raise SystemExit(f"{ds.train_path} not found: run scripts/download.py --dataset {ds.name}, or put the dataset files there")
 
     stream = stream_vectors(ds.train_path)
     first = next(stream)
@@ -52,9 +53,9 @@ def ingest(db, ds) -> None:
         got = table.search().where(f"id = {row_id}").select(["vector"]).limit(1).to_arrow()
         assert np.array_equal(np.array(got["vector"][0].as_py(), dtype=np.float32), expected), f"vector mismatch for id {row_id}"
 
-    print(f"{ds.name}: {rows} rows x {dim} dims into table {ds.table} in {seconds:.1f}s "
-          f"(peak RSS {get_peak_rss_mb():.0f} MB, table size {get_dir_size_mb(ds.table_dir):.0f} MB)")
+    print(f"{ds.name}: {rows} rows x {dim} dims into table {ds.table} in {seconds:.1f}s (table size {dir_size_mb(ds.table_dir):.0f} MB)")
     print(f"  checks passed: row count, ids are row positions, {len(samples)} stored vectors equal the CSV")
+    return seconds
 
 
 def main() -> None:

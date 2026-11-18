@@ -1,48 +1,41 @@
-"""HTTP client for the db container's wrapper (server.py)."""
-import time
-
+"""HTTP client for the db container's wrapper (server.py). It only sends goals; it holds no data."""
 import httpx
-import numpy as np
 
 from lancedb_bench.config import SERVER_URL
 
 
-class Client:
-    def __init__(self, base_url: str = SERVER_URL, timeout: float = 300.0):
-        self.http = httpx.Client(base_url=base_url, timeout=timeout)
+class InvalidParameters(ValueError):
+    """The server rejected the parameters of a goal (HTTP 422)."""
 
-    def _get(self, path: str) -> dict:
-        resp = self.http.get(path)
-        resp.raise_for_status()
-        return resp.json()
+
+class Client:
+    def __init__(self, base_url: str = SERVER_URL):
+        self.http = httpx.Client(base_url=base_url, timeout=None)  # goal 8 runs for minutes
+
+    @staticmethod
+    def _check(resp: httpx.Response) -> dict:
+        if resp.status_code == 200:
+            return resp.json()
+        try:
+            detail = resp.json().get("detail", resp.text)
+        except ValueError:
+            detail = resp.text
+        if resp.status_code == 422:
+            raise InvalidParameters(detail)
+        raise RuntimeError(f"{resp.request.method} {resp.request.url.path} failed ({resp.status_code}): {detail}")
 
     def health(self) -> dict:
-        return self._get("/health")
+        return self._check(self.http.get("/health"))
 
     def info(self) -> dict:
-        return self._get("/info")
+        return self._check(self.http.get("/info"))
 
     def datasets(self) -> list[dict]:
-        return self._get("/datasets")
+        return self._check(self.http.get("/datasets"))
 
     def reload(self) -> dict:
-        resp = self.http.post("/reload")
-        resp.raise_for_status()
-        return resp.json()
+        return self._check(self.http.post("/reload"))
 
-    def search(self, dataset: str, vector: np.ndarray | None = None, *, id: int | None = None, k: int = 10,
-               nprobes: int = 20, refine_factor: int | None = None, bypass_index: bool = False) -> tuple[dict, float]:
-        """One search. Returns (response, total_ms). total_ms is the client wall-clock for the whole call:
-        request serialization, network round trip, and response parsing. response["engine_latency_ms"] is the
-        server's own time around the LanceDB query, so total_ms - engine_latency_ms is the wrapper overhead."""
-        payload = {"dataset": dataset, "k": k, "nprobes": nprobes, "refine_factor": refine_factor,
-                   "bypass_index": bypass_index, "id": id}
-        t0 = time.perf_counter_ns()
-        if vector is not None:
-            payload["vector"] = vector.tolist()
-        resp = self.http.post("/search", json=payload)
-        data = resp.json()
-        total_ms = (time.perf_counter_ns() - t0) / 1e6
-        if resp.status_code != 200:
-            raise RuntimeError(f"search failed ({resp.status_code}): {data.get('detail', data)}")
-        return data, total_ms
+    def goal(self, goal: int, dataset: str, params: list) -> dict:
+        """Run one goal in the db container. Returns {"lines": [...], "note": "..."}."""
+        return self._check(self.http.post(f"/goal/{goal}", json={"dataset": dataset, "params": params}))

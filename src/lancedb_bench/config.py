@@ -1,9 +1,9 @@
 """Paths and per-dataset settings.
 
-Each container sees `DATA_DIR/<dataset>/...` but only its own files (see README):
-  db container:     train.csv
-  client container: test.csv, ground_truth.csv, manifest.json
-A dataset is a folder of the Hugging Face repo HF_REPO with those four files; scripts/download.py fetches them.
+The db container mounts a read-only `/data` (DATA_DIR) with one folder per dataset, exactly as in the Hugging Face
+repo HF_REPO: `<dataset>/{train.csv, test.csv, ground_truth.csv, manifest.json}` (scripts/download.py fetches them
+into ./data). The scripts and the benchmark run in the db container; the client container only sends goals
+(`db <goal> <params...>`) to it over HTTP and has no data.
 """
 import math
 import os
@@ -27,12 +27,21 @@ DATASETS = {
     "glove-200-angular": "cosine",  # angular = cosine
     "ccnews-nomic-768-normalized": "cosine",  # normalized vectors: cosine, dot and L2 rank alike
 }
-DEFAULT_DATASET = "cohere-small-100k"  # the smallest one, for quick tests
+DEFAULT_DATASET = "glove-200-angular"  # the common default of the class baseline, so `db 1 443321 4` is valid
 
-ROLE_FILES = {
-    "db": ["train.csv"],
-    "client": ["test.csv", "ground_truth.csv", "manifest.json"],
-}
+DATASET_FILES = ["train.csv", "test.csv", "ground_truth.csv", "manifest.json"]
+
+# Identity and results (common baseline, section 7: /results/build.csv and /results/search.csv)
+GROUP = os.getenv("GROUP", "07-strycharz-jarlaczynska")
+SYSTEM = "lancedb"
+
+# Search settings of the benchmark goal (db 8): nprobes is the accuracy setting that is swept (at least 3 values),
+# refine_factor stays fixed. Always set explicitly: LanceDB auto-tunes nprobes otherwise.
+NPROBES_SETTINGS = [int(x) for x in os.getenv("NPROBES_SETTINGS", "5,10,20,50").split(",")]
+REFINE_FACTOR = int(os.getenv("REFINE_FACTOR", 5))
+DEFAULT_NPROBES = int(os.getenv("NPROBES", 20))  # goals 1-7
+WARMUP = 200  # queries discarded before timing (baseline section 3)
+PASSES = 3  # timed passes over the first n test queries
 
 
 @dataclass(frozen=True)
@@ -73,9 +82,6 @@ class Dataset:
     def table_dir(self) -> Path:
         return Path(DB_URI) / f"{self.table}.lance"  # local DB_URI only
 
-    @property
-    def results_dir(self) -> Path:
-        return RESULTS_DIR / self.name
 
 
 def get_dataset(name: str | None = None) -> Dataset:
@@ -86,7 +92,7 @@ def get_dataset(name: str | None = None) -> Dataset:
 
 def select_datasets(name: str | None) -> list[Dataset]:
     """`all` selects every dataset in the registry; otherwise the named one (default: $DATASET or DEFAULT_DATASET)."""
-    if name == "all":
+    if (name or os.getenv("DATASET")) == "all":
         return [Dataset(n) for n in DATASETS]
     return [get_dataset(name)]
 

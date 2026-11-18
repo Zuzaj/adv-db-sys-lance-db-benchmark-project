@@ -1,31 +1,45 @@
 name: lancedb-bench
 
-# Two containers, as agreed in class (also for embedded databases):
-#   db      LanceDB (embedded) behind the FastAPI wrapper. Holds train.csv and the LanceDB directory.
-#   client  Benchmark client. Holds test.csv, ground_truth.csv and manifest.json only, talks to db over HTTP.
+# Standard commands of the class baseline (section 2), run from the repository root:
+#   docker compose build
+#   docker compose up -d db
+#   docker compose run --rm populate                      # load + index the dataset in $DATASET (default glove-200-angular, or `all`)
+#   docker compose run --rm benchmark db 1 443321 4       # one goal; without arguments: the benchmark (db 8) for k = 10 and 100
+#   docker compose run --rm populate python scripts/check_setup.py
 #
-#   docker compose up -d --build db
-#   docker compose exec db python scripts/ingest.py --dataset cohere-small-100k
-#   docker compose run --rm client python scripts/check_setup.py
+# Two containers (as agreed in class, also for embedded databases):
+#   db         LanceDB (embedded) behind a small HTTP wrapper. Holds all dataset files (./data, read-only), the LanceDB
+#              directory and /results. The goals and the timed benchmark run here, next to the database.
+#   benchmark  The client: the `db <goal> <params...>` CLI, sends the goals to db. No data, no database engine.
+# `populate` is the db image run once (in the same limits) to load and index the data.
 x-limits: &limits
-  cpuset: "0-3"      # 4 pinned cores
+  cpuset: "0-3"      # 4 pinned cores (the test server uses its own cpuset values)
   mem_limit: 8g
   memswap_limit: 8g  # swap off
 
+x-db: &db-service
+  image: lancedb-bench-db
+  <<: *limits
+  environment:
+    - SERVER_URL=http://db:8000
+    - DATASET  # passed through from the host if set, default glove-200-angular
+    - GROUP    # name of the group in the result files
+  volumes:
+    - ./data:/data:ro   # <dataset>/{train.csv, test.csv, ground_truth.csv, manifest.json}
+    - ./db:/db          # LanceDB directory
+    - ./results:/results
+
 services:
   db:
+    <<: *db-service
     build:
       context: .
       args:
         ROLE: db
     container_name: lancedb_server
-    <<: *limits
     command: uvicorn lancedb_bench.server:app --host 0.0.0.0 --port 8000 --workers 1
     ports:
       - "8000:8000"
-    volumes:
-      - ./data/db:/data:ro   # <dataset>/train.csv (read-only: the data may be hard-linked from another project)
-      - ./db:/db          # LanceDB directory
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:8000/health')"]
       interval: 5s
@@ -33,18 +47,23 @@ services:
       retries: 12
       start_period: 10s
 
-  client:
+  populate:
+    <<: *db-service
+    depends_on:
+      db:
+        condition: service_healthy
+    command: python scripts/populate.py
+
+  benchmark:
     build:
       context: .
       args:
         ROLE: client
-    container_name: lancedb_client
+    image: lancedb-bench-client
     depends_on:
       db:
         condition: service_healthy
     environment:
       - SERVER_URL=http://db:8000
-      - DATASET  # passed through from the host if set, default cohere-small-100k
-    volumes:
-      - ./data/client:/data:ro   # <dataset>/test.csv, ground_truth.csv, manifest.json
-      - ./results:/results
+      - DATASET
+    command: python scripts/bench.py

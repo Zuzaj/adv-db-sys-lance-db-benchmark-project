@@ -1,56 +1,60 @@
 # How the code works
 
 This document walks through the whole project: what each file does, what happens when you run a command, and why it
-was written that way. It describes the code as it is now (two containers, six datasets, CSV import from Hugging Face). The README has
-the commands; this file explains what is behind them.
+was written that way. It describes the code as it is now (two containers, six datasets, CSV import from Hugging Face,
+goals 1-8 of the class baseline). The README has the commands; this file explains what is behind them.
 
 ## 1. The big picture
 
 ```
-         Hugging Face repo zuzaj/ADB: <dataset>/{train.csv, test.csv, ground_truth.csv, manifest.json}
-                      |
-                      |  scripts/download.py  (on the host)
-                      v
-   data/db/<dataset>/train.csv            data/client/<dataset>/{test.csv, ground_truth.csv, manifest.json}
-          |                                             |
-          | mounted read-only as /data                  | mounted read-only as /data
-          v                                             v
- +-------------------------------+   HTTP   +----------------------------------+
- | db container (lancedb_server) | <------- | client container (lancedb_client)|
- |  scripts/ingest.py            |  :8000   |  scripts/check_setup.py          |
- |  scripts/build_index.py       |          |  scripts/bench.py                |
- |  server.py (FastAPI)          |          |  db CLI (cli.py)                 |
- |  LanceDB in ./db  (/db)       |          |  results written to ./results    |
- +-------------------------------+          +----------------------------------+
+   Hugging Face repo zuzaj/ADB: <dataset>/{train.csv, test.csv, ground_truth.csv, manifest.json}
+                |
+                |  scripts/download.py  (on the host, or the files are already on the server)
+                v
+        data/<dataset>/{train.csv, test.csv, ground_truth.csv, manifest.json}
+                |
+                | mounted read-only as /data
+                v
+ +----------------------------------------+   HTTP :8000   +--------------------------------+
+ | db container (lancedb_server)          | <------------- | benchmark container (client)   |
+ |  server.py (FastAPI) -> goals.py       |   one goal     |  db <goal> <params...> (cli.py)|
+ |  scripts/populate.py (same image, once)| -------------> |  scripts/bench.py              |
+ |  LanceDB in /db, results in /results   |   result lines |  no data, no database engine   |
+ +----------------------------------------+                +--------------------------------+
 ```
 
-Three ideas shape the design:
+Four ideas shape the design:
 
-1. **The database and the benchmark client are separate processes in separate containers**, even though LanceDB is an
-   embedded library. LanceDB only runs inside some process, so that process is a small HTTP service (`server.py`).
-   This was agreed in class for all databases.
-2. **Each container only sees its own data.** The database gets the training vectors; the client gets the test queries and
-   the correct answers (ground truth). The client never sees `train.csv`, and the client image does not even contain
-   LanceDB.
-3. **Everything about a dataset comes from its files plus one line in a registry.** Dimension and row count are read from
+1. **The database and the client are separate containers**, even though LanceDB is an embedded library. LanceDB only runs
+   inside some process, so that process is a small HTTP service (`server.py`). This was agreed in class for all databases.
+2. **All dataset files are in the db container** (read-only), so every group works with identical train, test and
+   ground-truth files. The test queries and the ground truth stay in files; only the train vectors are loaded into the
+   database. The client holds no data and no database engine: it only sends goals.
+3. **The goals and the benchmark run inside the db container**, next to the database. Each search call is timed there, so the
+   measured latency does not include the client-server hop (baseline section 3).
+4. **Everything about a dataset comes from its files plus one line in a registry.** Dimension and row count are read from
    the files; only the distance metric must be declared, because the CSVs do not say which one the ground truth uses.
 
 ## 2. Repository map
 
 | File | Runs in | What it does |
 |---|---|---|
-| `src/lancedb_bench/config.py` | both | Paths from environment variables, the dataset registry (name to metric), `Dataset` paths, `index_defaults()` |
-| `src/lancedb_bench/data.py` | both | Streaming readers for `train.csv`, `test.csv`, `ground_truth.csv` |
-| `src/lancedb_bench/metrics.py` | both | Recall@k, latency percentiles, peak memory, folder size |
+| `src/lancedb_bench/config.py` | both | Paths from environment variables, the dataset registry (name to metric), `Dataset` paths, search settings, `index_defaults()` |
+| `src/lancedb_bench/spec.py` | both | The eight goals, their parameters and types, the usage text |
+| `src/lancedb_bench/data.py` | db | Streaming readers for `train.csv`, `test.csv`, `ground_truth.csv` |
+| `src/lancedb_bench/metrics.py` | db | Recall@k, latency percentiles, folder size, `PeakRss` (memory sampling) |
+| `src/lancedb_bench/results.py` | db | The two result files `build.csv` and `search.csv` |
+| `src/lancedb_bench/goals.py` | db | Goals 1-8: queries, K-means, the timed benchmark |
 | `src/lancedb_bench/server.py` | db | FastAPI service around LanceDB |
-| `src/lancedb_bench/client.py` | client | HTTP client with client-side timing |
-| `src/lancedb_bench/cli.py` | client | The `db <goal> <params>` command |
-| `scripts/download.py` | host | Downloads the datasets from Hugging Face into `data/db` and `data/client` |
+| `src/lancedb_bench/client.py` | client | HTTP client |
+| `src/lancedb_bench/cli.py` | client | The `db <goal> <params...>` command with exit codes |
+| `scripts/download.py` | host | Downloads the datasets from Hugging Face into `data/<dataset>/` |
+| `scripts/populate.py` | db | Uploads everything: `ingest.py`, `build_index.py`, recall check, one row in `build.csv` |
 | `scripts/ingest.py` | db | `train.csv` into a LanceDB table |
 | `scripts/build_index.py` | db | IVF_PQ vector index and BTree index |
-| `scripts/check_setup.py` | client | Verifies the whole setup, per dataset |
-| `scripts/bench.py` | client | The benchmark: latency, throughput, recall |
-| `Dockerfile`, `docker-compose.yml` | host | The two containers |
+| `scripts/check_setup.py` | db | Verifies the whole setup, per dataset |
+| `scripts/bench.py` | client | Runs goal 8 for k = 10 and 100 and prints the summary |
+| `Dockerfile`, `docker-compose.yml` | host | The images and the three services |
 
 ## 3. Configuration and the dataset registry (`config.py`)
 
@@ -61,7 +65,11 @@ Three ideas shape the design:
 | `DATA_DIR` | `./data` | `/data` |
 | `DB_URI` | `./db` | `/db` |
 | `RESULTS_DIR` | `./results` | `/results` |
-| `SERVER_URL` | `http://localhost:8000` | `http://db:8000` (client container) |
+| `SERVER_URL` | `http://localhost:8000` | `http://db:8000` (client container and populate) |
+| `DATASET` | `glove-200-angular` | passed through from the host if set; `all` means every dataset |
+| `GROUP` | `07-strycharz-jarlaczynska` | name of the group in the result files |
+| `NPROBES_SETTINGS` | `5,10,20,50` | the `nprobes` values swept by goal 8 |
+| `REFINE_FACTOR`, `NPROBES` | 5, 20 | fixed `refine_factor` (all goals) and `nprobes` for goals 1-7 |
 
 **The registry** `DATASETS` maps a dataset name (the folder name) to a LanceDB distance type: `cosine`, `dot` or `l2`.
 The CSVs carry no metric, and using the wrong one gives wrong answers, so this is the one place that decides it. The
@@ -74,11 +82,10 @@ the ground truth.
 - `table`: the LanceDB table name, the dataset name with every non-word character replaced by `_`
   (`cohere-small-100k` becomes `cohere_small_100k`)
 - `table_dir`: where that table lives on disk, `DB_URI/<table>.lance` (used to report the size of one table)
-- `results_dir`: `RESULTS_DIR/<name>`
 - `metric`: looked up in the registry; an unknown name stops with an error listing the known datasets
 
-`get_dataset(name)` returns a `Dataset` (the name defaults to `$DATASET`, then to `cohere-small-100k`).
-`select_datasets("all")` returns every registry dataset. Every script offers `--dataset <name or all>`.
+`get_dataset(name)` returns a `Dataset` (the name defaults to `$DATASET`, then to `glove-200-angular`, the common default of the baseline).
+`select_datasets("all")` (or `DATASET=all`) returns every registry dataset. Every script offers `--dataset <name or all>`.
 
 **`index_defaults(n, dim)`** picks the starting IVF_PQ parameters:
 
@@ -86,9 +93,12 @@ the ground truth.
 - sub-vectors: `dim // 8`, lowered until it divides `dim` (product quantization needs that)
 
 Examples: 100,000 rows with 768 dimensions give 32 partitions and 96 sub-vectors; 1,183,514 rows with 200 dimensions give
-512 and 25. These are starting points, not tuned values; `build_index.py --partitions N --sub-vectors M` overrides them.
+512 and 25. These are starting points, not tuned values; `populate.py --partitions N --sub-vectors M` overrides them.
 
 ## 4. Reading the CSV files (`data.py`)
+
+`ingest.py` uses these readers for `train.csv`; goal 8, `populate.py` and `check_setup.py` use them for `test.csv` and
+`ground_truth.csv`. All of them run in the db container.
 
 The files are large (up to 5.2 GB), so nothing is read whole. All readers use `pyarrow.csv.open_csv`, which returns the
 file in blocks of 8 MiB.
@@ -124,40 +134,56 @@ of those queries has no neighbors.
 
 The six datasets were prepared once and published in the Hugging Face dataset repo `zuzaj/ADB` (`HF_REPO` in
 `config.py`, overridable by an environment variable): one folder per dataset with `train.csv`, `test.csv`,
-`ground_truth.csv` and `manifest.json`. The containers must not see each other's files, so the script puts them into two
-folders:
+`ground_truth.csv` and `manifest.json` (`DATASET_FILES` in `config.py`). The script puts them in the same layout under
+`--dest` (default `./data`):
 
 ```
-data/db/<dataset>/train.csv
-data/client/<dataset>/{test.csv, ground_truth.csv, manifest.json}
+data/<dataset>/{train.csv, test.csv, ground_truth.csv, manifest.json}
 ```
 
-`ROLE_FILES` in `config.py` defines which file belongs to which side. For each selected dataset and each file the script
-calls `huggingface_hub.hf_hub_download(..., local_dir=<dest>/<db or client>)`; the library keeps the repo's
-`<dataset>/<file>` path, which gives exactly the layout above, resumes interrupted downloads and skips files that are
-already complete. `--dataset all` downloads all six (about 18 GB), `--dest` changes the base folder (default `./data`).
+For each file it skips the download if the file already exists; otherwise it calls
+`huggingface_hub.hf_hub_download(..., local_dir=<dest>)`, which keeps the repo's `<dataset>/<file>` path, resumes
+interrupted downloads and never leaves a partial file at the final path. `--dataset all` downloads all six (about 18 GB).
 
-The script runs on the host. The containers mount the two folders **read-only**, so nothing inside a container can
-change the data.
+The script runs on the host. The db container mounts `./data` **read-only** as `/data`, so nothing inside the container can
+change the data. On the test server the files are already in its filesystem and this step is not needed.
 
 ## 6. The database side
 
+In practice you run `docker compose run --rm populate` (the db image, run once with the same limits). It runs
+`scripts/populate.py` for `$DATASET` (default `glove-200-angular`, or `all`). For each dataset it:
+
+1. calls `ingest()` (6.1) and `build()` (6.2) inside a `PeakRss` block and adds the two times: loading and indexing are
+   **one number**, `ingest_s`, because some systems index while loading and the baseline does not split them;
+2. checks that the index reaches recall@10 of at least 0.95 at some `nprobes` setting on the first 200 test queries
+   (printed; a warning if no setting reaches it, it does not fail the run);
+3. appends one row to `/results/build.csv` (`ingest_s`, `db_mb` after `optimize()`, `peak_mem_mb` from the sampler, CPU,
+   cores, RAM, date; `kmeans_s` stays empty until goal 4 runs).
+
+If a dataset fails (a missing file, ids that are not the row position, a bad parameter) it prints the reason and goes on with
+the next one. At the end it prints which datasets were populated and which failed, asks the running server
+(`SERVER_URL`) to reload its tables (`POST /reload`), and exits with 1 if anything failed, so an automated run can detect it.
+`ingest.py` and `build_index.py` can still be run separately, for example to rebuild only an index with other parameters.
+
+**Peak memory** (`metrics.PeakRss`): a thread samples the RSS of the process (and its children) every 100 ms with `psutil`
+and keeps the maximum. The page cache is not counted. Because LanceDB is embedded, this process is the database process.
+
 ### 6.1 Ingest (`scripts/ingest.py`)
 
-Runs in the db container: `python scripts/ingest.py --dataset <name or all>`.
+`python scripts/ingest.py --dataset <name or all>` (or through populate).
 
 1. **Stream.** `stream_vectors` yields batches of 10,000 vectors. The first batch is read up front to learn the dimension.
 2. **Schema (the "DDL as code").** Two columns: `id` as int64 and `vector` as a fixed-size list of float32 values of length
    `dim`. Vectors are always float32, because LanceDB cannot index other types.
 3. **Arrow batches.** Each batch becomes a `pyarrow.RecordBatch` (the flat float array is wrapped as a
    `FixedSizeListArray`). A generator of batches goes to `db.create_table(..., mode="overwrite")`, which writes the table
-   while consuming the stream, so the whole file is never in memory (peak process memory was 0.8 to 1.3 GB).
+   while consuming the stream, so the whole file is never in memory.
 4. **Id check.** While streaming, every batch must have ids equal to the row position (`0, 1, 2, ...`). The ground truth
    refers to these ids, so if they differed the ingest stops with an error.
 5. **Spot check.** It remembers a few vectors (the first of the first batch, one from every seventh batch up to a few, and
    the last row). After writing, it asserts that the row count equals the rows read, and reads each remembered
    vector back from the table by `id` and compares it exactly with the CSV value.
-6. It prints rows, dimension, time, peak memory and the size of the table.
+6. It prints rows, dimension, time and the size of the table, and returns the loading time.
 
 Re-running ingest overwrites the table (a new table version); the index must then be built again.
 
@@ -168,112 +194,106 @@ sub-vectors from `index_defaults` unless overridden (it refuses a sub-vector cou
 
 - **Vector index:** `IvfPq(distance_type=<registry metric>, num_partitions=..., num_sub_vectors=...)` on the `vector` column.
   The index must use the same metric as the queries.
-- **Scalar index:** a `BTree` on `id`, so lookups by id (the CLI's goal 1) do not scan the table.
+- **Scalar index:** a `BTree` on `id`, so lookups by id (goals 1-3, 5-7) do not scan the table.
 - **`optimize(cleanup_older_than=0)`** compacts the table and deletes every old version. This makes the printed table
   size the live size. LanceDB warns that readers still using an older version will fail, which is why the server
-  retries (section 7).
+  retries (6.4). It returns the time of all three steps.
 
 IVF_PQ in short: k-means splits the vectors into `num_partitions` groups; each vector is stored as a short code
 (`num_sub_vectors` bytes) instead of its full 4 x `dim` bytes. This is why the index is only 10 to 48 MB for tables of
 hundreds of MB, and why it is approximate.
 
-### 6.3 The HTTP wrapper (`src/lancedb_bench/server.py`)
+### 6.3 The goals (`src/lancedb_bench/goals.py`)
+
+Each goal is a function of a `Context` (the open table, the dataset, row count, dimension and `max_k`, the largest allowed
+k: 100, or the true neighbors per query of the dataset if fewer). It returns `{"lines": [...], "note": "..."}`: the result
+lines and an information line for stderr. Bad parameters raise `InvalidParameters` (a k above `max_k`, an id outside
+`0..rows-1`, a radius outside 0 to 2, a percent outside 1 to 100); a missing precondition raises `NotReady`.
+
+The vector query is `search(vec).distance_type(metric).limit(k).select(["id", "_distance"])` with either
+`nprobes(...).refine_factor(5)` or `bypass_vector_index()` (exact search, used by `check_setup.py`), and an optional
+`where(..., prefilter=True)`. `_distance` is selected explicitly because LanceDB adds it anyway and warns on every call
+otherwise. Neighbor goals use `neighbors_of`: look the stored vector up by id, ask for k + 1 neighbors, drop the vector itself.
+
+| Goal | How it works |
+|---|---|
+| 1 | `neighbors_of(id, k)` |
+| 2 | `neighbors_of(id, 100)`, keep distance <= radius; the count goes to the note |
+| 3 | `neighbors_of(id, k, where="id % 100 < percent")`: the prefilter is applied before the vector search |
+| 4 | `load_unit_vectors` reads the table (`to_arrow()`), orders it by id and scales to unit length; `kmeans()` takes ids 0..clusters-1 as start centers and runs exactly `iterations` rounds of: assign every vector to the center with the largest dot product (= cosine), set each center to the mean of its members (an empty cluster keeps its center), in chunks of 20,000 rows. No random numbers. The labels are those of the last assignment. They are stored with `add_columns(cluster_id int32)` and `merge_insert("id")`, a bitmap index on `cluster_id` and `optimize()`. The time goes to `kmeans_s` in `build.csv` |
+| 5 | Reads `cluster_id` of the row |
+| 6 | `neighbors_of(id, k, where="cluster_id = <cluster of id>")` |
+| 7 | Fetches both vectors and computes `1 - a.b / (|a||b|)` in float64 |
+| 8 | `run_setting` for each `nprobes` in `NPROBES_SETTINGS`, see below |
+
+**Goal 8, the benchmark** (`run_setting`). For one accuracy setting it first runs the 200 warm-up queries (discarded), then
+3 passes over the first n test queries, one at a time and one thread. The timed region is the whole search call (building
+the query, running it, getting the Arrow result) measured with `perf_counter_ns`; turning the ids into Python lists happens
+outside it, and only in the first pass, from which recall@k comes (overlap with the first k ground-truth ids, divided by k,
+averaged). p50, p95 and p99 are taken over all 3 x n latencies. One row per (dataset, k, setting) is appended to
+`/results/search.csv`; the note shows the peak memory of the run and the lowest `nprobes` with recall@10 of at least 0.95 (the
+baseline's headline number).
+
+### 6.4 The HTTP wrapper (`src/lancedb_bench/server.py`)
 
 A FastAPI app, started with `uvicorn lancedb_bench.server:app` (one worker). At import it opens the LanceDB folder
-`DB_URI`. It keeps a cache `dataset name -> (table handle, dimension)`.
+`DB_URI`. It keeps a cache `dataset name -> Context`.
 
 | Endpoint | Purpose |
 |---|---|
 | `GET /health` | Used by the Docker healthcheck |
-| `GET /info` | Server environment: LanceDB and pyarrow versions, cores (and how many are allowed), RAM, current and peak memory |
-| `GET /datasets` | For each registry dataset: whether its table exists, rows, dimension, table size, and every index (name, type, columns, indexed and unindexed rows, size, metric) |
-| `POST /reload` | Clears the table cache, so the next search opens the latest version |
-| `POST /search` | The query endpoint |
+| `GET /info` | Server environment: LanceDB and pyarrow versions, cores (and how many are allowed), RAM |
+| `GET /datasets` | For each registry dataset: whether its table exists, rows, dimension, table size, and every index (name, type, columns, unindexed rows, size, metric) |
+| `POST /reload` | Clears the cache, so the next goal opens the latest version |
+| `POST /goal/{n}` | Runs goal n with `{"dataset": ..., "params": [...]}` and returns `{"lines": [...], "note": ...}` |
 
-**`POST /search`** takes `dataset`, `k`, `nprobes`, `refine_factor`, `bypass_index` and either `vector` or `id`:
-
-1. Opens (or takes from the cache) the table. An unknown dataset gives 404; a dataset that is not ingested gives 503 with
-   the command to run.
-2. With `vector` it uses it. With `id` it looks the stored vector up (`where id = N`, served by the BTree) and asks for
-   `k + 1` neighbors, because the vector finds itself at distance 0 and is removed from the answer afterwards.
-3. A vector of the wrong length gives 400.
-4. It builds the LanceDB query: `search(vec).distance_type(metric).limit(k).select(["id", "_distance"])`. With
-   `bypass_index` it adds `bypass_vector_index()` (exact brute force), otherwise `nprobes(...)` and, if given,
-   `refine_factor(...)`.
-5. **It times only the LanceDB call** (`to_arrow()`) with `perf_counter_ns` and returns that as `engine_latency_ms`.
-6. The response is only `ids`, `distances` and the engine time, no vectors.
+`POST /goal/{n}` converts the parameters with `spec.parse_params` and calls the function in `goals.py`. Status codes: 422
+invalid parameters (including an unknown dataset), 409 a precondition is missing (goal 5 or 6 before goal 4), 503 the table
+does not exist (run populate).
 
 **`nprobes`** is how many partitions the index looks into; **`refine_factor`** makes the index fetch
 `k x refine_factor` candidates and re-rank them with their exact vectors. Both trade speed for recall.
 
-**Stale handles.** A table handle points at one table version. If ingest or `build_index.py` run while the server is up
-(and delete old versions), the cached handle can fail. `/search` therefore catches an error, drops that cached handle,
-and tries once more with a freshly opened one.
+**Stale handles.** A table handle points at one table version. If populate runs while the server is up (and deletes old
+versions), or goal 4 adds a column, the cached handle can fail. The endpoint therefore catches an error, drops that cached
+handle and tries once more with a freshly opened one; after goal 4 it drops the handle itself.
 
 ## 7. The client side
 
-### 7.1 `client.py`
+### 7.1 `client.py` and `cli.py` (the `db` command)
 
-A thin wrapper around `httpx.Client` with methods for each endpoint. `search()` returns `(response, total_ms)`, where
-`total_ms` is the wall-clock time on the client around the whole call: building the JSON (the vector list), the network
-round trip and parsing the response. The difference `total_ms - engine_latency_ms` is the overhead of the HTTP wrapper
-(about 1 ms in the Docker run).
+`Client` is a thin wrapper around `httpx.Client` (no timeout, because goal 8 runs for minutes) with `goal(n, dataset,
+params)`, `reload()`, `info()`, `datasets()` and `health()`. A 422 becomes `InvalidParameters`, any other error a `RuntimeError`.
 
-### 7.2 `scripts/check_setup.py` (the setup test)
+`db <goal> <params...>` takes the dataset from `$DATASET`. It first checks the parameters with the same
+`spec.parse_params` as the server (a typo needs no round trip), sends the goal, prints the result lines to stdout and the
+note to stderr. **Exit codes:** 0 success, 2 invalid parameters (wrong count or type, unknown goal or dataset, a value out of
+range), 1 any other failure (server not reachable, no table, goal 5 before goal 4).
 
-`python scripts/check_setup.py --dataset <name or all>` first checks that the server answers, calls `POST /reload`,
-prints the server environment, and fetches `/datasets`. Then for each dataset it runs these checks, printing
-`PASS`, `FAIL`, `WARN` or `INFO`:
+### 7.2 `scripts/bench.py`
+
+`docker compose run --rm benchmark` (default command): for each selected dataset and each k in 10 and 100 it calls goal 8 with
+n = 1,000 and prints the summary. A k that the dataset cannot serve (`uform-wiki-1m` has 10 neighbors) is reported as skipped.
+Exit code 1 if a run failed. The measurements themselves are made inside the db container.
+
+### 7.3 `scripts/check_setup.py` (the setup test)
+
+Runs in the db image: `docker compose run --rm populate python scripts/check_setup.py` (`--dataset <name or all>`). It talks to
+the database directly, not through HTTP. For each dataset it runs these checks, printing `PASS`, `FAIL`, `WARN` or `INFO`:
 
 | # | Check | Fails when |
 |---|---|---|
-| 1 | The client has `test.csv`, `ground_truth.csv`, `manifest.json` | A file is missing. It warns if `train.csv` is on the client side. |
+| 1 | The four dataset files exist | A file is missing |
 | 2 | Row count and dimension equal the manifest's `train_rows` and `dimension` | The table is missing, incomplete, or has another dimension |
 | 3 | A vector index exists, covers every row and has the registry's metric | Metric differs (warns if there is no index or rows are unindexed) |
 | 4 | **Exact search** (`bypass_index`) on 50 queries reproduces the ground truth, recall@10 at least 0.98 | Recall is lower: the metric or the id mapping is wrong |
 | 4b | Compares returned distances with the ground truth distances | Information only (shows the distance convention) |
-| 5 | **Approximate search** through the index with `nprobes=20`, `refine_factor=5` | Recall is zero (any recall above zero passes, so read the printed value) |
-| 6 | Lookup by id: `id=0, k=5` returns 5 neighbors without id 0 | Wrong count or the vector itself is returned |
+| 5 | **Approximate search** through the index | Recall is zero (any recall above zero passes, so read the printed value) |
+| 6 | Goal 1 (`id=0, k=5`) returns 5 neighbors without id 0; goal 3 returns only ids with `id % 100 < 10`; goal 7 gives a distance between 0 and 2 | Wrong count, the vector itself, a broken filter |
 
 Check 4 is the most important one: brute-force search is correct by construction, so if it does not match the
 ground truth, the data, ids or metric are wrong. Any exception for one dataset is reported as a FAIL and the script
 continues with the next dataset. The exit code is 1 if any dataset failed, 0 otherwise.
-
-### 7.3 `scripts/bench.py` (the benchmark)
-
-`python scripts/bench.py --dataset <name> [--nprobes ...] [--refine ...] [-k ...] [--exact] [--n-queries N]`
-
-Protocol, per dataset and per configuration (k, nprobes, refine_factor):
-
-1. Read the first `N` test queries (default 1,000) and their ground truth. Values of `k` larger than the ground truth
-   has neighbors (`uform-wiki-1m` has 10) are skipped.
-2. **Warm-up:** 200 queries, not counted.
-3. **Timed passes:** 3 passes over all queries, each query one HTTP call. Latency statistics use all samples.
-4. **Recall@k** is computed on the first pass: the overlap between the returned ids and the first `k` ground-truth ids,
-   divided by `k`, averaged over queries.
-5. `--exact` adds a brute-force run per `k` as a reference.
-
-Each configuration produces one CSV row in `results/<dataset>/<--out>` (default `bench.csv`) with: parameters, recall,
-and for three measurements (`total_*`: client wall clock; `engine_*`: server time; `overhead_*`: the difference) the
-p50, p95, p99, mean and QPS. Every row also carries the environment: client and server machine, cores (and how many
-are allowed), RAM, Python and LanceDB versions, git commit, the server's peak memory and the table size.
-If an existing file has other columns, results go to a new timestamped file instead of mixing columns.
-
-### 7.4 `cli.py` (the `db` command)
-
-`db <goal> <params>` with the dataset taken from `$DATASET`. Only two goals exist so far:
-
-- `db 1 <id> <k>`: the neighbors of a stored vector, excluding itself (the wrapper's `id` path).
-- `db 8 <n_queries> <k>`: the first `n` test queries; prints recall@k and latency (client total and server engine).
-
-Both use `nprobes=20` and `refine_factor=5` unless `NPROBES` and `REFINE_FACTOR` are set. Other goal numbers print
-"not defined yet".
-
-### 7.5 `metrics.py`
-
-`calculate_recall_at_k` (set overlap divided by `k`), `compute_latency_stats` (p50, p95, p99, mean, QPS as
-1000 / mean ms), `get_peak_rss_mb` (peak memory of the process, converted from the platform's unit) and
-`get_dir_size_mb` (total file size of a folder).
 
 ## 8. The containers
 
@@ -285,57 +305,61 @@ Both use `nprobes=20` and `refine_factor=5` unless `NPROBES` and `REFINE_FACTOR`
   do not reinstall them.
 - It sets `DATA_DIR=/data`, `DB_URI=/db`, `RESULTS_DIR=/results` and `OMP_NUM_THREADS=1`.
 
-**`docker-compose.yml`** defines two services:
+**`docker-compose.yml`** defines three services, the standard commands of the baseline (`docker compose build`,
+`up -d db`, `run --rm populate`, `run --rm benchmark db 1 443321 4`):
 
-| | `db` (container `lancedb_server`) | `client` (container `lancedb_client`) |
-|---|---|---|
-| Image | `ROLE=db` | `ROLE=client` |
-| Command | `uvicorn lancedb_bench.server:app` on port 8000 | none: you run scripts with `docker compose run` |
-| Mounts | `./data/db` as `/data` (read-only), `./db` as `/db` | `./data/client` as `/data` (read-only), `./results` as `/results` |
-| Limits | 4 pinned cores (0-3), 8 GB RAM, swap off | none |
-| Other | healthcheck calls `/health` | waits until `db` is healthy; `SERVER_URL=http://db:8000` |
+| | `db` (container `lancedb_server`) | `populate` | `benchmark` |
+|---|---|---|---|
+| Image | `lancedb-bench-db` (`ROLE=db`) | the same | `lancedb-bench-client` (`ROLE=client`) |
+| Command | `uvicorn lancedb_bench.server:app` on port 8000 | `python scripts/populate.py` | `python scripts/bench.py`, or any `db <goal> ...` |
+| Mounts | `./data` as `/data` (read-only), `./db` as `/db`, `./results` as `/results` | the same | none |
+| Limits | 4 pinned cores (0-3), 8 GB RAM, swap off | the same | none |
+| Other | healthcheck calls `/health` | waits until `db` is healthy; `SERVER_URL=http://db:8000` | waits until `db` is healthy; `SERVER_URL=http://db:8000` |
 
-The database container is the system under test, so only it is limited. Scripts for the db side run with
-`docker compose exec db ...` (inside the running server container, sharing its CPU and memory limits), the client
-side with `docker compose run --rm client ...`.
+The database is the system under test, so it and the populate step share the limits. The benchmark container is not
+CPU-pinned here; on the test server the baseline gives it its own core.
 
-## 9. One search from start to end
+## 9. One goal from start to end
 
-`docker compose run --rm client db 1 42 5` (dataset `cohere-small-100k`):
+`DATASET=cohere-small-100k docker compose run --rm benchmark db 1 42 5`:
 
-1. `cli.py` builds a `Client` and calls `search("cohere-small-100k", id=42, k=5, nprobes=20, refine_factor=5)`.
-2. The client sends `POST http://db:8000/search` with that JSON and starts its timer.
-3. `server.py` opens the cached table, finds vector 42 by id through the BTree, and builds a LanceDB query for `k + 1 = 6`
-   neighbors with metric cosine, 20 probes and refine factor 5.
+1. `cli.py` checks the parameters (`spec.parse_params`) and calls `Client.goal(1, "cohere-small-100k", ["42", "5"])`, that is
+   `POST http://db:8000/goal/1` with `{"dataset": "cohere-small-100k", "params": ["42", "5"]}`.
+2. `server.py` converts the parameters, opens the cached `Context` and calls `goal_1`.
+3. `goal_1` checks k, finds vector 42 by id through the BTree and builds a LanceDB query for `k + 1 = 6` neighbors with metric
+   cosine, 20 probes and refine factor 5.
 4. LanceDB compares the query vector with the 32 partition centers, scans the compressed vectors of the 20 closest
    partitions, keeps the `6 x 5 = 30` best candidates, fetches their exact vectors and re-ranks them.
-5. The server removes id 42 from the six results, and returns the 5 ids, their distances and the time spent in LanceDB.
-6. The client stops its timer, parses the answer and prints the ids with their cosine distances.
+5. The goal removes id 42 from the six results and returns five lines `id distance`.
+6. The client prints the lines and exits with 0.
 
 ## 10. Design decisions and limits
 
 - **Why a registry line for the metric.** Dimension and size can be read from files, but the metric cannot, and a wrong
   one only shows up as bad recall. Declaring it once and verifying it by exact search is the cheapest safe approach.
-- **Why two data folders.** The client must not be able to read the training data and the database must not read the test
-  data, so each container mounts only its own folder, read-only.
+- **Why all files are in the db container and the benchmark runs there.** It follows the baseline: identical files for every
+  group (no accidental swap), and the timing excludes the client-server hop. The cost is that the database container can in
+  principle see the test queries; we only read them from the files in the benchmark.
 - **Why the check is exact search first.** It tests ids, metric and data without involving the approximate index, so a
   failure there points to the import, not to index tuning.
-- **Ingest and indexing are scripts, not endpoints.** They take minutes; HTTP requests for that would need background
-  jobs and status polling. Running them inside the container with `docker compose exec` is simpler.
+- **Populate is a script, not an endpoint.** It takes minutes; HTTP requests for that would need background jobs and status
+  polling. Running it as a one-off container of the same image is simpler.
+- **K-means is outside the engine.** LanceDB has no clustering query, so goal 4 runs numpy in the db container and stores
+  the result in the table. It loads all vectors into memory (about 0.3 GB for `cohere-small-100k`).
 - **Known limits:**
-  - Recall is not tuned: one `nprobes` and `refine_factor` for all datasets.
+  - Recall is not tuned: one `refine_factor` and four `nprobes` values for all datasets. The recall check in populate only warns.
   - The approximate-search check in `check_setup.py` passes with any recall above zero.
-  - Only goals 1 and 8 exist.
-  - The client container is not CPU-pinned, and all measurements so far are warm, single runs on a laptop.
+  - The goals follow baseline proposals the class has not approved. The goal 2 radius gives 0 to 100 results for stored vectors.
+  - The new setup was run for `cohere-small-100k` only (natively and in Docker, goals 1, 4 and 8 in Docker); the other five datasets and goals 2, 3, 5, 6 and 7 in Docker are untested.
   - Table versions: indexing deletes old versions, so do not run searches while `build_index.py` runs.
 
 ## 11. How to extend it
 
 - **Add a dataset:** add its folder (the same four files) to the Hugging Face repo, add `"<name>": "<metric>"` to
-  `DATASETS` in `config.py`, run `download.py --dataset <name>`, then ingest, index and check it with the same commands. Always read
+  `DATASETS` in `config.py`, run `download.py --dataset <name>`, then populate and check it with the same commands. Always read
   the `check_setup.py` result before trusting a new metric (LanceDB's L2 distance is the squared distance, so an L2
   dataset's distances will differ from a plain Euclidean ground truth, which the check reports as information).
-- **Add a goal to the `db` command:** add a function in `cli.py` and a branch in `main()`. If it needs a new kind of
-  query, add a field to `SearchRequest` and handle it in `run_search` in `server.py`.
-- **Tune an index:** `build_index.py --dataset <name> --partitions N --sub-vectors M`, then `bench.py` with a sweep such as
-  `--nprobes 1 5 20 100 --refine 1 5 20 --exact` and compare the CSV rows.
+- **Change a goal or add one:** add its parameters to `GOALS` in `spec.py`, write the function in `goals.py` and add it to
+  `GOAL_FUNCTIONS`. The CLI, the server and the usage text pick it up.
+- **Tune an index:** `populate.py --dataset <name> --partitions N --sub-vectors M`, then `db 8 1000 10` and compare the
+  rows in `results/search.csv`; change the swept settings with `NPROBES_SETTINGS`.
