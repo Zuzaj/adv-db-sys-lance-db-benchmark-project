@@ -37,7 +37,7 @@ SYSTEM = "lancedb"
 
 # Search settings of the benchmark goal (db 8): nprobes is the accuracy setting that is swept (at least 3 values),
 # refine_factor stays fixed. Always set explicitly: LanceDB auto-tunes nprobes otherwise.
-NPROBES_SETTINGS = [int(x) for x in os.getenv("NPROBES_SETTINGS", "5,10,20,50").split(",")]
+NPROBES_SETTINGS = [int(x) for x in os.getenv("NPROBES_SETTINGS", "5,10,20,50,100,200").split(",")]
 REFINE_FACTOR = int(os.getenv("REFINE_FACTOR", 5))
 DEFAULT_NPROBES = int(os.getenv("NPROBES", 20))  # goals 1-7
 WARMUP = 200  # queries discarded before timing (baseline section 3)
@@ -106,9 +106,25 @@ def add_dataset_arg(parser) -> None:
 
 def index_defaults(n: int, dim: int) -> tuple[int, int]:
     """Starting IVF_PQ parameters: about 2300 vectors per partition (power of two), dim/8 sub-vectors
-    (reduced until it divides dim). Override on the CLI."""
+    (reduced until it divides dim). Override on the CLI or with INDEX_PARAMS."""
     partitions = 2 ** max(0, round(math.log2(max(n / 2300, 1))))
     sub_vectors = max(1, dim // 8)
     while dim % sub_vectors:
         sub_vectors -= 1
     return partitions, sub_vectors
+
+
+# Tuned (partitions, sub-vectors) for datasets where the defaults do not reach recall@10 >= 0.95 at any nprobes <= 200
+# (the baseline's requirement). Measured with the populate check on 200 test queries, refine_factor=5:
+#   glove-200-angular   defaults (512, 25): 0.63 at nprobes=50; (256, 100): 0.97 at nprobes=100
+#   nytimes-256-angular defaults (128, 32): 0.84 at nprobes=50; (128, 64): 0.97 at nprobes=100
+#   pubmed-arxiv        defaults (128, 96): 0.94 at nprobes=50; (128, 192): 0.97 at nprobes=10
+INDEX_PARAMS = {
+    "glove-200-angular": (256, 100),
+    "nytimes-256-angular": (128, 64),
+    "pubmed-arxiv": (128, 192),
+}
+
+
+def index_params(name: str, n: int, dim: int) -> tuple[int, int]:
+    return INDEX_PARAMS.get(name) or index_defaults(n, dim)

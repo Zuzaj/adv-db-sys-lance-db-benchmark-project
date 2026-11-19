@@ -6,7 +6,7 @@ from datetime import timedelta
 import lancedb
 from lancedb.index import BTree, IvfPq
 
-from lancedb_bench.config import DB_URI, add_dataset_arg, index_defaults, select_datasets
+from lancedb_bench.config import DB_URI, add_dataset_arg, index_params, select_datasets
 from lancedb_bench.metrics import dir_size_mb
 
 
@@ -14,7 +14,7 @@ def build(db, ds, partitions: int | None, sub_vectors: int | None) -> float:
     """Build the vector index and the id index, then optimize. Returns the time in seconds."""
     table = db.open_table(ds.table)
     n, dim = table.count_rows(), table.schema.field("vector").type.list_size
-    default_partitions, default_sub_vectors = index_defaults(n, dim)
+    default_partitions, default_sub_vectors = index_params(ds.name, n, dim)
     partitions, sub_vectors = partitions or default_partitions, sub_vectors or default_sub_vectors
     if dim % sub_vectors:
         raise SystemExit(f"num_sub_vectors={sub_vectors} must divide dim={dim}")
@@ -44,8 +44,8 @@ def build(db, ds, partitions: int | None, sub_vectors: int | None) -> float:
 def main() -> None:
     parser = argparse.ArgumentParser()
     add_dataset_arg(parser)
-    parser.add_argument("--partitions", type=int, help="default: see config.index_defaults")
-    parser.add_argument("--sub-vectors", type=int, help="default: see config.index_defaults")
+    parser.add_argument("--partitions", type=int, help="default: see config.INDEX_PARAMS and index_defaults")
+    parser.add_argument("--sub-vectors", type=int, help="default: see config.INDEX_PARAMS and index_defaults")
     args = parser.parse_args()
     db = lancedb.connect(DB_URI)
     for ds in select_datasets(args.dataset):

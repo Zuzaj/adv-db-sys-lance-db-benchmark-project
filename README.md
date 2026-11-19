@@ -188,14 +188,15 @@ is valid. For quick tests use `DATASET=cohere-small-100k`, the smallest one.
 **To add a dataset:** add a folder with the same four files to the Hugging Face repo, add one line to `DATASETS` in
 `config.py` (name and metric), and run the same commands with the new name. Each dataset gets its own table in the
 database and its own folder in `results/`. Dimension and row count are read from the files, and index parameters default
-to about 2,300 vectors per partition and dimension/8 sub-vectors (`config.index_defaults`); override them with
+to about 2,300 vectors per partition and dimension/8 sub-vectors (`config.index_defaults`); datasets where that does not
+reach recall@10 of 0.95 have tuned values in `config.INDEX_PARAMS` (section 8.2); override both with
 `populate.py --partitions N --sub-vectors M`. Ground truth may have fewer neighbors than 100 (`uform-wiki-1m` has 10);
 the goals reject a k that is too large for the dataset (exit code 2).
 
 Limits: LanceDB's L2 `_distance` is the squared distance, so if you add an L2 dataset, compare against the ground
 truth with `check_setup.py` (it prints the difference between the two distance conventions). The goals 1-7 use fixed
 `nprobes=20` and `refine_factor=5` (override with `NPROBES` and `REFINE_FACTOR` in the db container); goal 8 sweeps
-`nprobes` over 5, 10, 20 and 50 (`NPROBES_SETTINGS`) with `refine_factor=5`. None of it is tuned per dataset.
+`nprobes` over 5, 10, 20, 50, 100 and 200 (`NPROBES_SETTINGS`) with `refine_factor=5`. These settings are the same for every dataset.
 
 ## 5. Design and implementation process
 
@@ -240,7 +241,7 @@ table.search(vec).distance_type(metric).nprobes(20).refine_factor(5).limit(k).se
 | 5 | `db 5 <id>` | Reads `cluster_id` of the row; exit code 1 if goal 4 has not run yet. |
 | 6 | `db 6 <id> <k>` | Same as goal 1 with the prefilter `cluster_id = <cluster of id>`. |
 | 7 | `db 7 <id_a> <id_b>` | Fetches both stored vectors and prints the cosine distance (1 - cosine similarity, float64). |
-| 8 | `db 8 <n_queries> <k>` | The benchmark: for each `nprobes` in 5, 10, 20, 50 it runs 200 warm-up queries and 3 passes over the first n test queries (one at a time, ids only), prints recall@k and p50, p95, p99, and appends the rows to `/results/search.csv`. |
+| 8 | `db 8 <n_queries> <k>` | The benchmark: for each `nprobes` in 5, 10, 20, 50, 100, 200 it runs 200 warm-up queries and 3 passes over the first n test queries (one at a time, ids only), prints recall@k and p50, p95, p99, and appends the rows to `/results/search.csv`. |
 
 Result files (columns as in the baseline): `build.csv` has one row per populate run (`ingest_s` is loading plus indexing,
 `peak_mem_mb` is the process RSS sampled every 100 ms with psutil); `search.csv` has one row per dataset, k and `nprobes`.
@@ -321,6 +322,75 @@ run --rm populate`, then `db 1 42 5`, `db 4 100 20` and the default `benchmark` 
 | 100 | 10 | 0.9588 | 16.81 | 19.31 | 24.47 |
 | 100 | 20 | 0.9793 | 18.67 | 20.40 | 22.33 |
 | 100 | 50 | 0.9802 | 19.79 | 21.45 | 23.18 |
+
+**All six datasets in Docker** (`DATASET=all docker compose run --rm populate`, same environment, default index parameters
+of `config.index_defaults`, `nprobes` up to 50, one run; the rows are in `results/build.csv`). The recall columns are the populate check on the
+first 200 test queries, k = 10, `refine_factor=5`:
+
+| Dataset | Loading + indexing | Index (partitions, sub-vectors) | Database size | Peak memory | Recall@10 at `nprobes` 5 / 10 / 20 / 50 |
+|---|---|---|---|---|---|
+| `cohere-small-100k` | 125 s | 32, 96 | 315 MB | 1810 MB | 0.916 / 0.968 / 0.977 / 0.977 |
+| `nytimes-256-angular` | 46 s | 128, 32 | 306 MB | 1652 MB | 0.609 / 0.683 / 0.767 / **0.838** |
+| `pubmed-arxiv` | 151 s | 128, 96 | 1255 MB | 2519 MB | 0.872 / 0.916 / 0.934 / **0.939** |
+| `uform-wiki-1m` | 92 s | 512, 32 | 1056 MB | 2175 MB | 0.931 / 0.951 / 0.956 / 0.958 |
+| `glove-200-angular` | 73 s | 512, 25 | 982 MB | 2205 MB | 0.518 / 0.567 / 0.600 / **0.628** |
+| `ccnews-nomic-768-normalized` | 189 s | 256, 96 | 1553 MB | 3252 MB | 0.878 / 0.932 / 0.952 / 0.959 |
+
+Populate worked for all six. Three datasets (bold) do not reach the baseline's requirement of recall@10 of at least 0.95
+at any of the four `nprobes` settings with the default index, so populate printed its warning for them.
+
+**Tuning the three datasets** (native runs on the Mac, `scripts/populate.py` check on 200 test queries, `refine_factor=5`;
+recall only, the timings of those runs are not comparable because several builds ran at the same time). Two findings:
+
+- **The number of probed partitions was the main limit, not only the compression.** An `IvfFlat` index (no compression)
+  with the same 512 partitions gave the same recall as IVF_PQ with 100 sub-vectors on glove-200 (0.853 against 0.854 at
+  `nprobes=50`) and needed `nprobes=200` to pass 0.95 (0.960). So `NPROBES_SETTINGS` now goes up to 200.
+- **Too few sub-vectors cost recall.** With the default sub-vectors, glove-200 and nytimes lost most: 0.63 at
+  `nprobes=50` (25 sub-vectors, 512 partitions), against 0.83 with 50 and 0.85 with 100. `refine_factor` 20 and 50
+  instead of 5 changed recall by at most 0.04 and usually by less than 0.01.
+
+The chosen values (`config.INDEX_PARAMS`) and the recall of the populate check afterwards:
+
+| Dataset | Default (partitions, sub-vectors) | Tuned | Recall@10 at `nprobes` 5 / 10 / 20 / 50 / 100 / 200 with the tuned index | First setting >= 0.95 |
+|---|---|---|---|---|
+| `glove-200-angular` | 512, 25 | 256, 100 | 0.706 / 0.786 / 0.845 / 0.913 / 0.966 / 1.000 | `nprobes=100` |
+| `nytimes-256-angular` | 128, 32 | 128, 64 | 0.642 / 0.729 / 0.824 / 0.927 / 0.969 / 0.969 | `nprobes=100` |
+| `pubmed-arxiv` | 128, 96 | 128, 192 | 0.907 / 0.966 / 0.988 / 0.9995 / 1.000 / 1.000 | `nprobes=10` |
+
+Only these three datasets were changed; `cohere-small-100k`, `uform-wiki-1m` and `ccnews-nomic-768-normalized` already
+reach 0.95 with the defaults (`uform-wiki-1m` and `ccnews-nomic-768-normalized` only barely, at `nprobes=10` and 20). Costs
+of the tuned indexes (native Mac, so not comparable with the Docker numbers above): loading + indexing 70 s, 88 s and 207 s,
+database size 1148 MB, 323 MB and 1326 MB. The nytimes row reaches only 0.969 at `nprobes=200`, which is all of the
+128 partitions: that is the limit of 64 sub-vectors, and 128 sub-vectors gave 0.931 at `nprobes=50` against 0.912 (tested with
+the older, smaller nprobes grid). Whether the settings are the best choice (for example fewer partitions for glove-200: 128
+partitions with 100 sub-vectors reached 0.965 at `nprobes=50`, but each probe scans more) was not explored further.
+
+**All six datasets in Docker with the tuned indexes** (`DATASET=all`: `populate`, `check_setup.py` and the default
+`benchmark` command, same environment, one warm run, 1000 queries x 3 passes after 200 warm-up queries, `refine_factor=5`;
+rows in `results/build.csv` and `results/search.csv`). All six pass `check_setup.py` (exact search recall@10 of at least 0.998
+against the ground truth) and now reach recall@10 of at least 0.95 at some `nprobes` setting:
+
+| Dataset | Loading + indexing | Database size | Peak memory (build) | First `nprobes` with recall@10 >= 0.95 | p50 / p95 / p99 there | Best recall@10 (`nprobes=200`) |
+|---|---|---|---|---|---|---|
+| `cohere-small-100k` | 105 s | 314 MB | 1825 MB | 10 (0.966) | 6.0 / 8.9 / 12.7 ms | 0.977 |
+| `nytimes-256-angular` | 55 s | 323 MB | 1692 MB | 100 (0.953) | 13.0 / 17.3 / 25.5 ms | 0.953 |
+| `pubmed-arxiv` | 195 s | 1326 MB | 2629 MB | 10 (0.969) | 6.9 / 8.6 / 10.4 ms | 1.000 |
+| `uform-wiki-1m` | 80 s | 1051 MB | 2286 MB | 10 (0.957) | 3.7 / 4.4 / 5.3 ms | 0.960 |
+| `glove-200-angular` | 85 s | 1148 MB | 2421 MB | 100 (0.967) | 20.1 / 25.0 / 34.8 ms | 0.997 |
+| `ccnews-nomic-768-normalized` | 163 s | 1550 MB | 3372 MB | 20 (0.954) | 8.4 / 11.0 / 13.9 ms | 0.962 |
+
+- **The tuning worked in Docker:** the three tuned datasets now pass, with recall values close to the native check (glove
+  0.9665 against 0.966, nytimes 0.953 against 0.969, pubmed 0.9685 against 0.966). nytimes is the one that moved: 0.953
+  on 1000 queries against 0.969 on the first 200, so it sits only just above the target and is the weakest case.
+- **The price is latency at high `nprobes`:** glove-200 and nytimes need `nprobes=100`, so their p50 (20 and 13 ms) is two to
+  five times that of the datasets that pass at `nprobes=10`. At k = 100 the first setting with recall@100 of at least 0.95 is
+  `nprobes=200` for glove-200 (0.938 at 100, 0.996 at 200), `nprobes=10` for pubmed
+  (0.950), `nprobes=20` for cohere (0.980) and `nprobes=50` for ccnews (0.958); nytimes does not pass 0.95 at k = 100
+  (0.949 at best). The 0.95 requirement of the baseline is for k = 10.
+- `uform-wiki-1m` has no k = 100 run: its ground truth holds 10 neighbors, so the goal refuses k above 10.
+- **`check_setup.py` prints a lower recall** for nytimes and glove (0.828 and 0.834) than the benchmark, because it checks the
+  approximate search at the default `nprobes=20`, not at the setting that reaches 0.95.
+- Latencies and peak memory come from one run each and were not repeated.
 
 What it shows:
 
@@ -473,8 +543,8 @@ Notes:
   the handle itself, and a goal on an outdated handle is retried once on a fresh one.
 - `build_index.py` removes old table versions (so the reported size is the live size). LanceDB warns that this can
   break other processes still reading an older version, so do not benchmark while it runs.
-- Goal 8 runs for minutes (4 settings x (200 + 3 x n) searches), and the client waits without a timeout. Change the swept
-  settings with `NPROBES_SETTINGS=5,10,20,50` (db container) and the name of the group with `GROUP`.
+- Goal 8 runs for many minutes (6 settings x (200 + 3 x n) searches, the high `nprobes` are slower), and the client waits without a timeout. Change the swept
+  settings with `NPROBES_SETTINGS=5,10,20,50,100,200` (db container) and the name of the group with `GROUP`.
 
 ## 10. Self-evaluation
 
@@ -485,14 +555,15 @@ Adding a dataset needs one line of configuration.
 
 Shortcomings:
 
-- **Recall is not tuned.** Default index parameters and `refine_factor=5` give recall from 0.98 down to 0.56 at
-  `nprobes=20` in the earlier Docker run (section 8.3), and the goals use fixed settings. The new populate check only warns
-  when no `nprobes` setting reaches recall@10 of 0.95; it was only run for `cohere-small-100k`.
+- **Recall is tuned only enough to pass 0.95.** The default index parameters gave recall@10 from 0.98 down to 0.56 at
+  `nprobes=20` in the earlier Docker run (section 8.3). Three datasets got tuned parameters (section 8.2), checked natively with
+  200 test queries; the other three keep the defaults. The goals use fixed settings, the populate check only warns, and we
+  did not explore the best trade-off between index size, build time and speed.
 - **The measurements are first runs, not the benchmark.** The new setup was run for one dataset (`cohere-small-100k`),
   natively and in Docker Desktop on a Mac, once each; the six-dataset run is from the earlier Docker layout, with 50
   queries per dataset and no cold-cache run. Differences of about 0.01 to 0.04 recall between index builds are noise.
-  The other five datasets have not been populated or benchmarked with the new setup, and the benchmark client container
-  is not CPU-pinned.
+  The other five datasets were populated with the new setup but not benchmarked (goal 8) or checked with `check_setup.py`,
+  and the benchmark client container is not CPU-pinned.
 - Peak memory is the RSS of the database process sampled every 100 ms (page cache not counted), not a cgroup measurement.
   For goal 4 it includes the numpy copy of all vectors.
 - `check_setup.py` passes the approximate-search check with any recall above zero, so a poor index still shows PASS; read the printed recall.

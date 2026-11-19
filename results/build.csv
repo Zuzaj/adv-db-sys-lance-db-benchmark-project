@@ -1,2 +1,14 @@
 group,system,version,dataset,ingest_s,db_mb,peak_mem_mb,cpu,cores,ram_gb,date,kmeans_s
 07-strycharz-jarlaczynska,lancedb,0.40.0,cohere-small-100k,118.19,314.6,1718,aarch64,4,8.3,2026-11-18,8.75
+07-strycharz-jarlaczynska,lancedb,0.40.0,cohere-small-100k,125.09,314.61,1810,aarch64,4,8.3,2026-11-18,
+07-strycharz-jarlaczynska,lancedb,0.40.0,nytimes-256-angular,45.84,306.36,1652,aarch64,4,8.3,2026-11-18,
+07-strycharz-jarlaczynska,lancedb,0.40.0,pubmed-arxiv,150.62,1255.03,2519,aarch64,4,8.3,2026-11-18,
+07-strycharz-jarlaczynska,lancedb,0.40.0,uform-wiki-1m,91.94,1056.0,2175,aarch64,4,8.3,2026-11-18,
+07-strycharz-jarlaczynska,lancedb,0.40.0,glove-200-angular,72.54,981.63,2205,aarch64,4,8.3,2026-11-18,
+07-strycharz-jarlaczynska,lancedb,0.40.0,ccnews-nomic-768-normalized,188.64,1552.79,3252,aarch64,4,8.3,2026-11-18,
+07-strycharz-jarlaczynska,lancedb,0.40.0,cohere-small-100k,105.31,313.98,1825,aarch64,4,8.3,2026-11-19,
+07-strycharz-jarlaczynska,lancedb,0.40.0,nytimes-256-angular,54.58,322.55,1692,aarch64,4,8.3,2026-11-19,
+07-strycharz-jarlaczynska,lancedb,0.40.0,pubmed-arxiv,195.46,1326.4,2629,aarch64,4,8.3,2026-11-19,
+07-strycharz-jarlaczynska,lancedb,0.40.0,uform-wiki-1m,79.67,1051.0,2286,aarch64,4,8.3,2026-11-19,
+07-strycharz-jarlaczynska,lancedb,0.40.0,glove-200-angular,84.83,1147.92,2421,aarch64,4,8.3,2026-11-19,
+07-strycharz-jarlaczynska,lancedb,0.40.0,ccnews-nomic-768-normalized,163.32,1550.16,3372,aarch64,4,8.3,2026-11-19,

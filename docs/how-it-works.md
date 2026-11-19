@@ -39,7 +39,7 @@ Four ideas shape the design:
 
 | File | Runs in | What it does |
 |---|---|---|
-| `src/lancedb_bench/config.py` | both | Paths from environment variables, the dataset registry (name to metric), `Dataset` paths, search settings, `index_defaults()` |
+| `src/lancedb_bench/config.py` | both | Paths from environment variables, the dataset registry (name to metric), `Dataset` paths, search settings, `index_defaults()`, `INDEX_PARAMS` |
 | `src/lancedb_bench/spec.py` | both | The eight goals, their parameters and types, the usage text |
 | `src/lancedb_bench/data.py` | db | Streaming readers for `train.csv`, `test.csv`, `ground_truth.csv` |
 | `src/lancedb_bench/metrics.py` | db | Recall@k, latency percentiles, folder size, `PeakRss` (memory sampling) |
@@ -68,7 +68,7 @@ Four ideas shape the design:
 | `SERVER_URL` | `http://localhost:8000` | `http://db:8000` (client container and populate) |
 | `DATASET` | `glove-200-angular` | passed through from the host if set; `all` means every dataset |
 | `GROUP` | `07-strycharz-jarlaczynska` | name of the group in the result files |
-| `NPROBES_SETTINGS` | `5,10,20,50` | the `nprobes` values swept by goal 8 |
+| `NPROBES_SETTINGS` | `5,10,20,50,100,200` | the `nprobes` values swept by goal 8 |
 | `REFINE_FACTOR`, `NPROBES` | 5, 20 | fixed `refine_factor` (all goals) and `nprobes` for goals 1-7 |
 
 **The registry** `DATASETS` maps a dataset name (the folder name) to a LanceDB distance type: `cosine`, `dot` or `l2`.
@@ -190,7 +190,7 @@ Re-running ingest overwrites the table (a new table version); the index must the
 ### 6.2 Indexes (`scripts/build_index.py`)
 
 For each dataset it opens the table, reads the row count and dimension, and takes the default partitions and
-sub-vectors from `index_defaults` unless overridden (it refuses a sub-vector count that does not divide the dimension).
+sub-vectors from `config.INDEX_PARAMS` (tuned values for glove-200, nytimes and pubmed) or `index_defaults` unless overridden (it refuses a sub-vector count that does not divide the dimension).
 
 - **Vector index:** `IvfPq(distance_type=<registry metric>, num_partitions=..., num_sub_vectors=...)` on the `vector` column.
   The index must use the same metric as the queries.
@@ -350,7 +350,7 @@ CPU-pinned here; on the test server the baseline gives it its own core.
   - Recall is not tuned: one `refine_factor` and four `nprobes` values for all datasets. The recall check in populate only warns.
   - The approximate-search check in `check_setup.py` passes with any recall above zero.
   - The goals follow baseline proposals the class has not approved. The goal 2 radius gives 0 to 100 results for stored vectors.
-  - The new setup was run for `cohere-small-100k` only (natively and in Docker, goals 1, 4 and 8 in Docker); the other five datasets and goals 2, 3, 5, 6 and 7 in Docker are untested.
+  - The goals were run for `cohere-small-100k` only (natively; goals 1, 4 and 8 also in Docker). All six datasets were populated in Docker, but the other five were not benchmarked, and goals 2, 3, 5, 6 and 7 are untested in Docker.
   - Table versions: indexing deletes old versions, so do not run searches while `build_index.py` runs.
 
 ## 11. How to extend it

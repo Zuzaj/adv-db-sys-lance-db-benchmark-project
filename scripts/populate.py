@@ -59,8 +59,8 @@ def reload_server() -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     add_dataset_arg(parser)
-    parser.add_argument("--partitions", type=int, help="IVF partitions (default: see config.index_defaults)")
-    parser.add_argument("--sub-vectors", type=int, help="PQ sub-vectors (default: see config.index_defaults)")
+    parser.add_argument("--partitions", type=int, help="IVF partitions (default: see config.INDEX_PARAMS and index_defaults)")
+    parser.add_argument("--sub-vectors", type=int, help="PQ sub-vectors (default: see config.INDEX_PARAMS and index_defaults)")
     args = parser.parse_args()
 
     db = lancedb.connect(DB_URI)
